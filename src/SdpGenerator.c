@@ -430,7 +430,18 @@ static PSDP_OPTION getAttributesList(char*urlSafeAddr) {
         snprintf(payloadStr, sizeof(payloadStr), "%d", slicesPerFrame);
         err |= addAttributeString(&optionHead, "x-nv-video[0].videoEncoderSlicesPerFrame", payloadStr);
 
-        if (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_AV1) {
+        if (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_PYROWAVE) {
+            // PyroWave wire bitStreamFormat value (Sunshine extension).
+            err |= addAttributeString(&optionHead, "x-nv-vqos[0].bitStreamFormat", "3");
+
+            // Opt-in adaptive streaming (Sunshine extension). Optional
+            // attributes: hosts without support simply ignore them.
+            err |= addAttributeString(&optionHead, "x-ss-video[0].pyrowaveAdaptiveFec",
+                                      StreamConfig.pyroWaveAdaptiveFec ? "1" : "0");
+            err |= addAttributeString(&optionHead, "x-ss-video[0].pyrowaveAdaptiveBitrate",
+                                      StreamConfig.pyroWaveAdaptiveBitrate ? "1" : "0");
+        }
+        else if (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_AV1) {
             err |= addAttributeString(&optionHead, "x-nv-vqos[0].bitStreamFormat", "2");
         }
         else if (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_H265) {

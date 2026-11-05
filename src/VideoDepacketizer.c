@@ -93,6 +93,20 @@ static void cleanupFrameState(void) {
     nalChainDataLength = 0;
 }
 
+// Some codecs are "self-recovering": every frame fully refreshes the picture (PyroWave is
+// effectively intra-refreshing), so a lost or incomplete frame heals on the very next frame.
+// For these, packet loss must NOT trigger the IDR-wait/request machinery or be treated as a
+// stream-breaking event - that only produces needless IDR-request spam and stalls. Mirrors
+// pyrofling's own "self-recovering" handling of PyroWave.
+static bool isSelfRecoveringFormat(void) {
+    return (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_PYROWAVE) != 0;
+}
+
+// Fork extension: set when a packet-loss gap inside a PyroWave frame was
+// tolerated; the next queued fragment is tagged BUFFER_TYPE_GAP so the
+// decoder can resynchronize its parser at the loss point.
+static bool pyroWaveGapPending;
+
 // Cleanup frame state and set that we're waiting for an IDR Frame
 static void dropFrameState(void) {
     // This may only be called at frame boundaries
@@ -100,6 +114,17 @@ static void dropFrameState(void) {
 
     // We're dropping frame state now
     dropStatePending = false;
+
+    if (isSelfRecoveringFormat()) {
+        // Discard the incomplete frame and move on without engaging the
+        // IDR-wait machinery. With conditional replenishment (host omits
+        // unchanged blocks) the host must be told to re-send what we missed:
+        // a full-refresh request is cheap (one normal-budget frame).
+        consecutiveFrameDrops = 0;
+        cleanupFrameState();
+        LiRequestIdrFrame();
+        return;
+    }
 
     if (strictIdrFrameWait || !idrFrameProcessed || waitingForIdrFrame) {
         // We'll need an IDR frame now if we're in non-RFI mode, if we've never
@@ -214,6 +239,11 @@ void validateDecodeUnitForPlayback(PDECODE_UNIT decodeUnit) {
         }
         else if (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_AV1) {
             // We don't parse the AV1 bitstream
+            LC_ASSERT_VT(decodeUnit->bufferList->bufferType == BUFFER_TYPE_PICDATA);
+        }
+        else if (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_PYROWAVE) {
+            // We don't parse the PyroWave bitstream; an IDR frame is a single
+            // self-delimiting picture-data buffer.
             LC_ASSERT_VT(decodeUnit->bufferList->bufferType == BUFFER_TYPE_PICDATA);
         }
         else {
@@ -510,8 +540,11 @@ static void reassembleFrame(int frameNumber) {
                 if (LbqOfferQueueItem(&decodeUnitQueue, qdu, &qdu->entry) == LBQ_BOUND_EXCEEDED) {
                     Limelog("Video decode unit queue overflow\n");
 
-                    // RFI recovery is not supported here
-                    waitingForIdrFrame = true;
+                    // RFI recovery is not supported here (skip the IDR wait for
+                    // self-recovering codecs, which heal on the next frame)
+                    if (!isSelfRecoveringFormat()) {
+                        waitingForIdrFrame = true;
+                    }
 
                     // Clear NAL state for the frame that we failed to enqueue
                     nalChainHead = qdu->decodeUnit.bufferList;
@@ -524,7 +557,9 @@ static void reassembleFrame(int frameNumber) {
                     // Free all frames in the decode unit queue
                     freeDecodeUnitList(LbqFlushQueueItems(&decodeUnitQueue));
 
-                    // Request an IDR frame to recover
+                    // Request an IDR frame to recover. For self-recovering codecs this
+                    // maps to a cheap full-refresh frame (needed with conditional
+                    // replenishment so the dropped frame's blocks are re-sent).
                     LiRequestIdrFrame();
                     return;
                 }
@@ -632,6 +667,15 @@ static void queueFragment(PLENTRY_INTERNAL* existingEntry, char* data, int offse
         }
 
         entry->entry.bufferType = getBufferFlags(entry->entry.data, entry->entry.length);
+
+        // Fork extension (PyroWave partial frames): tag the first fragment
+        // after a tolerated packet-loss gap so the decoder can resynchronize
+        // its bitstream parser exactly at the loss point instead of
+        // misparsing the remainder of the frame.
+        if (pyroWaveGapPending) {
+            entry->entry.bufferType = BUFFER_TYPE_GAP;
+            pyroWaveGapPending = false;
+        }
 
         nalChainDataLength += entry->entry.length;
 
@@ -779,17 +823,46 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
     // the streamPacketIndex not matching correctly should find nearly all of the rest.
     if (isBefore24(streamPacketIndex, U24(lastPacketInStream + 1)) ||
             (!(flags & FLAG_SOF) && streamPacketIndex != U24(lastPacketInStream + 1))) {
-        Limelog("Depacketizer detected corrupt frame: %d", frameIndex);
-        decodingFrame = false;
-        nextFrameNumber = frameIndex + 1;
-        dropFrameState();
-        if (waitingForIdrFrame) {
-            LiRequestIdrFrame();
+        // Self-recovering codecs (PyroWave): a FORWARD gap inside a frame is
+        // expected when the RTP queue delivers the surviving packets of an
+        // FEC-unrecoverable frame. Tolerate the gap instead of dropping the
+        // rest of the frame, and tag the fragment that follows it
+        // (BUFFER_TYPE_GAP) so the decoder resynchronizes its parser there.
+        if (!(isSelfRecoveringFormat() && decodingFrame &&
+                !isBefore24(streamPacketIndex, U24(lastPacketInStream + 1)))) {
+            Limelog("Depacketizer detected corrupt frame: %d", frameIndex);
+            decodingFrame = false;
+            nextFrameNumber = frameIndex + 1;
+            dropFrameState();
+            if (waitingForIdrFrame) {
+                LiRequestIdrFrame();
+            }
+            else {
+                connectionDetectedFrameLoss(startFrameNumber, frameIndex);
+            }
+            return;
         }
         else {
-            connectionDetectedFrameLoss(startFrameNumber, frameIndex);
+            // Gap tolerated: mark the next queued fragment for parser resync.
+            pyroWaveGapPending = true;
         }
-        return;
+    }
+
+    // Self-recovering codecs: handle frames with lost boundary packets rather
+    // than asserting/desyncing on them.
+    if (isSelfRecoveringFormat()) {
+        if (firstPacket && decodingFrame) {
+            // The previous frame's EOF was lost: submit what arrived (missing
+            // blocks are kept/zeroed) and start this frame normally.
+            decodingFrame = false;
+            reassembleFrame(nextFrameNumber);
+            LiRequestIdrFrame();
+        }
+        else if (!firstPacket && !decodingFrame) {
+            // This frame's SOF was lost: without the frame header we cannot
+            // start the frame, so ignore its remaining packets.
+            return;
+        }
     }
     
     // Verify that we didn't receive an incomplete frame
@@ -812,8 +885,12 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
 
             nextFrameNumber = frameIndex;
 
-            // Wait until next complete frame
-            waitingForNextSuccessfulFrame = true;
+            // Wait until next complete frame. Self-recovering codecs don't use
+            // the successful-frame gating (they never set the IDR/RFI waits);
+            // dropFrameState() below already requests the refresh they need.
+            if (!isSelfRecoveringFormat()) {
+                waitingForNextSuccessfulFrame = true;
+            }
             dropFrameState();
         }
         else {
@@ -1125,6 +1202,28 @@ static void processRtpPayload(PNV_VIDEO_PACKET videoPacket, int length,
 void notifyFrameLost(unsigned int frameNumber, bool speculative) {
     // We may not invalidate frames that we've already received
     LC_ASSERT(frameNumber >= startFrameNumber);
+
+    // Self-recovering codecs (PyroWave): salvage whatever arrived. The RTP
+    // queue delivers the received packets of an unrecoverable frame before
+    // this notification; PyroWave block packets are RTP-payload aligned, so
+    // the decoder uses the received blocks and keeps/zeroes the missing ones.
+    // Then ask the host for a full refresh so stale blocks heal immediately
+    // (with conditional replenishment the host would otherwise not re-send
+    // unchanged-but-lost blocks until their rolling refresh turn).
+    if (isSelfRecoveringFormat()) {
+        unsigned int lossStart = startFrameNumber;
+        nextFrameNumber = frameNumber + 1;
+        if (decodingFrame) {
+            decodingFrame = false;
+            reassembleFrame(frameNumber);
+        }
+        else {
+            dropFrameState();
+        }
+        connectionDetectedFrameLoss(lossStart, frameNumber);
+        LiRequestIdrFrame();
+        return;
+    }
 
     // Drop state and determine if we need an IDR frame or if RFI is okay
     dropFrameState();

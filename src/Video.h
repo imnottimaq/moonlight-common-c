@@ -67,4 +67,10 @@ typedef struct _SS_FRAME_FEC_STATUS {
     uint8_t multiFecBlockCount;
 } SS_FRAME_FEC_STATUS, *PSS_FRAME_FEC_STATUS;
 
+// Phase-offset pacing feedback (client -> Sunshine host, Sunshine extension).
+// Payload is a single little-endian int32: the client's measured phase offset in
+// microseconds (ideal_present_time - frame_done_time). Positive => server should slow
+// down slightly, negative => speed up. Mirrors pyrofling's PYRO_MESSAGE_PHASE_OFFSET.
+#define SS_PHASE_OFFSET_PTYPE 0x5510
+
 #pragma pack(pop)

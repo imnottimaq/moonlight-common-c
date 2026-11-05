@@ -608,6 +608,16 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
                 // we must manually advance the queue to the next frame. Parsing this
                 // frame further is not possible.
                 if (queue->currentFrameNumber == nvPacket->frameIndex) {
+                    // Self-recovering codecs (PyroWave): before discarding, deliver the
+                    // received data packets of the unrecoverable frame to the
+                    // depacketizer. Block packets are aligned to RTP payloads, so the
+                    // decoder can use the surviving blocks and keep/zero the missing
+                    // ones (the depacketizer tolerates the gaps for these formats).
+                    if (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_PYROWAVE) {
+                        stageCompleteFecBlock(queue);
+                        submitCompletedFrame(queue);
+                    }
+
                     // Discard any unsubmitted buffers from the previous frame
                     purgeListEntries(&queue->pendingFecBlockList);
                     purgeListEntries(&queue->completedFecBlockList);
@@ -643,6 +653,16 @@ int RtpvAddPacket(PRTP_VIDEO_QUEUE queue, PRTP_PACKET packet, int length, PRTPV_
                     nvPacket->frameIndex,
                     expectedFecBlockNumber + 1,
                     fecCurrentBlockNumber);
+
+            // Self-recovering codecs (PyroWave): before discarding, deliver the
+            // received data packets of the unrecoverable frame to the
+            // depacketizer. Block packets are aligned to RTP payloads, so the
+            // decoder can use the surviving blocks and keep/zero the missing
+            // ones (the depacketizer tolerates the gaps for these formats).
+            if (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_PYROWAVE) {
+                stageCompleteFecBlock(queue);
+                submitCompletedFrame(queue);
+            }
 
             // Discard any unsubmitted buffers from the previous frame
             purgeListEntries(&queue->pendingFecBlockList);

@@ -485,9 +485,15 @@ void connectionSawFrame(uint32_t frameIndex) {
 
     if (now - intervalStartTimeMs >= CONN_STATUS_SAMPLE_PERIOD) {
         if (intervalTotalFrameCount != 0) {
-            // Notify the client of connection status changes based on frame loss rate
+            // Notify the client of connection status changes based on frame loss rate.
+            // Self-recovering codecs (PyroWave) refresh fully every frame, so a lost frame
+            // heals on the next one - it is not a "poor connection" the way a lost reference
+            // frame is for H.264/HEVC/AV1. Don't raise the poor-connection warning for them
+            // (matches pyrofling, which does not treat PyroWave loss as a stream problem).
             int frameLossPercent = 100 - (intervalGoodFrameCount * 100) / intervalTotalFrameCount;
-            if (lastConnectionStatusUpdate != CONN_STATUS_POOR &&
+            bool selfRecovering = (NegotiatedVideoFormat & VIDEO_FORMAT_MASK_PYROWAVE) != 0;
+            if (!selfRecovering &&
+                    lastConnectionStatusUpdate != CONN_STATUS_POOR &&
                     (frameLossPercent >= CONN_IMMEDIATE_POOR_LOSS_RATE ||
                      (frameLossPercent >= CONN_CONSECUTIVE_POOR_LOSS_RATE && lastIntervalLossPercentage >= CONN_CONSECUTIVE_POOR_LOSS_RATE))) {
                 // We require 2 consecutive intervals above CONN_CONSECUTIVE_POOR_LOSS_RATE or a single
@@ -854,6 +860,23 @@ static bool sendMessageAndForget(short ptype, short paylen, const void* payload,
     }
 
     return ret;
+}
+
+// Phase-offset pacing feedback to the host (Sunshine + PyroWave). Sent unsequenced on the
+// generic control channel - it's latest-wins telemetry, so dropping stale hints is fine.
+// sendMessageEnet takes enetMutex internally, so this is safe to call from the render thread.
+void LiSendPhaseOffset(int offsetUs) {
+    int32_t payload;
+
+    // Only Sunshine understands this extension, and only over the ENet control stream.
+    if (!IS_SUNSHINE() || peer == NULL) {
+        return;
+    }
+
+    // Little-endian int32 (both client and host are little-endian).
+    payload = (int32_t)offsetUs;
+    sendMessageEnet(SS_PHASE_OFFSET_PTYPE, sizeof(payload), &payload,
+                    CTRL_CHANNEL_GENERIC, ENET_PACKET_FLAG_UNSEQUENCED, false);
 }
 
 static bool sendMessageAndDiscardReply(short ptype, short paylen, const void* payload, uint8_t channelId, uint32_t flags, bool moreData) {

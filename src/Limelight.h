@@ -100,6 +100,13 @@ typedef struct _STREAM_CONFIGURATION {
     // in /launch and /resume requests.
     char remoteInputAesKey[16];
     char remoteInputAesIv[16];
+
+    // PyroWave (Sunshine extension): opt-in adaptive streaming. When set, the
+    // host may raise FEC (adaptiveFec) and/or temporarily lower the encode
+    // bitrate (adaptiveBitrate) in response to observed packet loss. Both
+    // default to off (zeroed by LiInitializeStreamConfiguration).
+    int pyroWaveAdaptiveFec;
+    int pyroWaveAdaptiveBitrate;
 } STREAM_CONFIGURATION, *PSTREAM_CONFIGURATION;
 
 // Use this function to zero the stream configuration when allocated on the stack or heap
@@ -112,6 +119,10 @@ void LiInitializeStreamConfiguration(PSTREAM_CONFIGURATION streamConfig);
 #define BUFFER_TYPE_SPS      0x01
 #define BUFFER_TYPE_PPS      0x02
 #define BUFFER_TYPE_VPS      0x03
+// Fork extension (PyroWave partial frames): picture data that immediately
+// follows a tolerated packet-loss gap. The decoder must resynchronize its
+// bitstream parser at the start of this buffer (or truncate the frame there).
+#define BUFFER_TYPE_GAP      0x04
 
 typedef struct _LENTRY {
     // Pointer to the next entry or NULL if this is the last entry
@@ -228,6 +239,7 @@ typedef struct _DECODE_UNIT {
 #define VIDEO_FORMAT_AV1_MAIN10      0x2000 // AV1 Main 10-bit profile
 #define VIDEO_FORMAT_AV1_HIGH8_444   0x4000 // AV1 High 4:4:4 8-bit profile
 #define VIDEO_FORMAT_AV1_HIGH10_444  0x8000 // AV1 High 4:4:4 10-bit profile
+#define VIDEO_FORMAT_PYROWAVE        0x010000 // PyroWave GPU wavelet codec (8-bit 4:2:0), Sunshine extension
 
 // Masks for clients to use to match video codecs without profile-specific details.
 #define VIDEO_FORMAT_MASK_H264   0x000F
@@ -235,6 +247,7 @@ typedef struct _DECODE_UNIT {
 #define VIDEO_FORMAT_MASK_AV1    0xF000
 #define VIDEO_FORMAT_MASK_10BIT  0xAA00
 #define VIDEO_FORMAT_MASK_YUV444 0xCC04
+#define VIDEO_FORMAT_MASK_PYROWAVE 0x0F0000 // group reserved for future PyroWave profiles
 
 // If set in the renderer capabilities field, this flag will cause audio/video data to
 // be submitted directly from the receive thread. This should only be specified if the
@@ -509,6 +522,7 @@ void LiInitializeConnectionCallbacks(PCONNECTION_LISTENER_CALLBACKS clCallbacks)
 #define SCM_HEVC_REXT10_444 0x00100000 // Sunshine extension
 #define SCM_AV1_HIGH8_444   0x00200000 // Sunshine extension
 #define SCM_AV1_HIGH10_444  0x00400000 // Sunshine extension
+#define SCM_PYROWAVE        0x00800000 // PyroWave codec, Sunshine extension
 
 // SCM masks to identify various codec capabilities
 #define SCM_MASK_H264   (SCM_H264 | SCM_H264_HIGH8_444)
@@ -571,6 +585,12 @@ int LiSendExecServerCmd(uint8_t cmdId);
 // This function sends an empty payload to the server.
 // This method exists here for workaround client side wifi sleeps.
 int LiSendEmptyPayload();
+
+// Sends a phase-offset pacing hint to the host (Sunshine + PyroWave only). offsetUs is
+// (ideal_present_time - frame_done_time) in microseconds; positive asks the host to slow
+// its capture cadence slightly, negative to speed up. Safe to call once per presented
+// frame from the render thread; a no-op on non-Sunshine hosts. Mirrors pyrofling pacing.
+void LiSendPhaseOffset(int offsetUs);
 
 // This function queues a relative mouse move event to be sent to the remote server.
 int LiSendMouseMoveEvent(short deltaX, short deltaY);
