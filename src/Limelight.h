@@ -589,6 +589,16 @@ const char* LiGetStageName(int stage);
 // This function may only be called between LiStartConnection() and LiStopConnection().
 bool LiGetEstimatedRttInfo(uint32_t* estimatedRtt, uint32_t* estimatedRttVariance);
 
+// This function sends a request to the server to execute the requested cmd id.
+int LiSendExecServerCmd(uint8_t cmdId);
+
+// This function sends an empty payload to the server.
+// This method exists here for workaround client side wifi sleeps.
+int LiSendEmptyPayload(void);
+
+// This function sends clipboard text to the server.
+int LiSendSetClipboard(const char* text, int length);
+
 // Sends a phase-offset pacing hint to the host (Sunshine + PyroWave only). offsetUs is
 // (ideal_present_time - frame_done_time) in microseconds; positive asks the host to slow
 // its capture cadence slightly, negative to speed up. Safe to call once per presented
